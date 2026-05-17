@@ -25,14 +25,16 @@ type BookEntry = {
   title: string
   image_url: string | null
   summary: string | null
+  day_order: number
 }
 
-type EntryMap = Record<string, BookEntry>
+// date → sorted list of entries
+type EntryMap = Record<string, BookEntry[]>
 
 type ModalState =
   | { mode: 'closed' }
-  | { mode: 'view'; entry: BookEntry }
-  | { mode: 'form'; date: string }
+  | { mode: 'view'; date: string; index: number }
+  | { mode: 'add'; date: string }
 
 type Tab = 'calendar' | 'library'
 
@@ -69,20 +71,22 @@ async function fetchMonthEntries(year: number, month: number): Promise<BookEntry
   const { data, error } = await supabase
     .from('book_entries').select('*')
     .gte('date', start).lte('date', end)
-    .order('date', { ascending: true })
+    .order('date').order('day_order')
   if (error) throw new Error(error.message)
   return data ?? []
 }
 
-async function saveEntry(entry: { date: string; title: string; image_url: string; summary: string }): Promise<BookEntry> {
+async function addEntry(entry: {
+  date: string; title: string; image_url: string; summary: string; day_order: number
+}): Promise<BookEntry> {
   const { data, error } = await supabase
-    .from('book_entries').upsert(entry, { onConflict: 'date' }).select().single()
+    .from('book_entries').insert(entry).select().single()
   if (error) throw new Error(error.message)
   return data
 }
 
-async function deleteEntry(date: string): Promise<void> {
-  const { error } = await supabase.from('book_entries').delete().eq('date', date)
+async function deleteEntry(id: string): Promise<void> {
+  const { error } = await supabase.from('book_entries').delete().eq('id', id)
   if (error) throw new Error(error.message)
 }
 
@@ -109,25 +113,16 @@ async function deleteBook(id: string): Promise<void> {
   if (error) throw new Error(error.message)
 }
 
-// ─── shared image input ───────────────────────────────────────────────────────
+// ─── shared components ────────────────────────────────────────────────────────
 
-function ImageInput({
-  preview, onFile, onUrl, onClear, uploadName,
-}: {
+function ImageInput({ preview, onFile, onUrl, onClear }: {
   preview: string
   onFile: (url: string, file: File) => void
   onUrl: (url: string) => void
   onClear: () => void
-  uploadName: string
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const inputCls = "w-full px-3.5 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-400 focus:border-transparent transition"
-
-  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    onFile(URL.createObjectURL(file), file)
-  }
 
   if (preview) return (
     <div className="flex justify-center">
@@ -146,18 +141,17 @@ function ImageInput({
         <span className="text-xs font-medium">Upload from device</span>
         <span className="text-[10px] text-zinc-300 dark:text-zinc-600">JPG, PNG, WEBP, AVIF</span>
       </button>
-      <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
+      <input ref={fileInputRef} type="file" accept="image/*"
+        onChange={e => { const f = e.target.files?.[0]; if (f) onFile(URL.createObjectURL(f), f) }}
+        className="hidden" />
       <div className="flex items-center gap-2 text-xs text-zinc-300 dark:text-zinc-600">
-        <div className="flex-1 h-px bg-zinc-100 dark:bg-zinc-800" />
-        <span>or paste URL</span>
+        <div className="flex-1 h-px bg-zinc-100 dark:bg-zinc-800" /><span>or paste URL</span>
         <div className="flex-1 h-px bg-zinc-100 dark:bg-zinc-800" />
       </div>
       <input type="url" placeholder="https://…" onChange={e => onUrl(e.target.value)} className={inputCls} />
     </div>
   )
 }
-
-// ─── ThemeToggle ──────────────────────────────────────────────────────────────
 
 function ThemeToggle() {
   const { theme, toggle } = useTheme()
@@ -169,30 +163,28 @@ function ThemeToggle() {
   )
 }
 
-// ─── BookModal (entry form) ───────────────────────────────────────────────────
+// ─── AddEntryModal ────────────────────────────────────────────────────────────
 
-function EntryModal({
-  date, books, onClose, onSave,
-}: {
+function AddEntryModal({ date, books, dayOrder, onClose, onSave }: {
   date: string
   books: Book[]
+  dayOrder: number
   onClose: () => void
-  onSave: (d: { date: string; title: string; image_url: string; summary: string }) => Promise<void>
+  onSave: (entry: BookEntry) => void
 }) {
   const activeBooks = books.filter(b => !b.completed)
-
-  // 'select' = pick from library, 'manual' = type manually
   const [inputMode, setInputMode] = useState<'select' | 'manual'>(activeBooks.length > 0 ? 'select' : 'manual')
-  const [selectedBookId, setSelectedBookId] = useState<string>('')
+  const [selectedBookId, setSelectedBookId] = useState('')
   const [title, setTitle] = useState('')
   const [imageFile, setImageFile] = useState<File | null>(null)
   const [imagePreview, setImagePreview] = useState('')
   const [summary, setSummary] = useState('')
   const [saving, setSaving] = useState(false)
 
-  const selectedBook = activeBooks.find(b => b.id === selectedBookId)
+  const inputCls = "w-full px-3.5 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-400 focus:border-transparent transition"
 
-  const clearImage = () => { setImageFile(null); setImagePreview('') }
+  const selectedBook = activeBooks.find(b => b.id === selectedBookId)
+  const canSubmit = inputMode === 'select' ? !!selectedBookId : !!title.trim()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -200,37 +192,34 @@ function EntryModal({
     try {
       let finalTitle = title.trim()
       let finalImage = imagePreview
-
       if (inputMode === 'select' && selectedBook) {
         finalTitle = selectedBook.title
         finalImage = selectedBook.image_url ?? ''
-        if (imageFile) finalImage = await uploadCover(imageFile, date)
-      } else {
-        if (imageFile) finalImage = await uploadCover(imageFile, date)
       }
-
-      await onSave({ date, title: finalTitle, image_url: finalImage, summary: summary.trim() })
+      if (imageFile) finalImage = await uploadCover(imageFile, `${date}-${dayOrder}`)
+      const saved = await addEntry({ date, title: finalTitle, image_url: finalImage, summary: summary.trim(), day_order: dayOrder })
+      onSave(saved)
       onClose()
     } finally {
       setSaving(false)
     }
   }
 
-  const inputCls = "w-full px-3.5 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-400 focus:border-transparent transition"
-
-  const canSubmit = inputMode === 'select' ? !!selectedBookId : !!title.trim()
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto border border-zinc-100 dark:border-zinc-800">
-        <div className="p-5 border-b border-zinc-100 dark:border-zinc-800">
-          <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500 uppercase tracking-widest">{date}</p>
-          <h2 className="text-lg font-bold text-zinc-900 dark:text-zinc-50 mt-0.5">Log a book</h2>
+        <div className="p-5 border-b border-zinc-100 dark:border-zinc-800 flex items-center justify-between">
+          <div>
+            <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500 uppercase tracking-widest">{date}</p>
+            <h2 className="text-lg font-bold text-zinc-900 dark:text-zinc-50 mt-0.5">
+              {dayOrder === 1 ? 'Log a book' : `Add book #${dayOrder}`}
+            </h2>
+          </div>
+          <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-xl text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors text-lg">×</button>
         </div>
 
         <form onSubmit={handleSubmit} className="p-5 flex flex-col gap-4">
-
-          {/* mode toggle */}
           {activeBooks.length > 0 && (
             <div className="flex rounded-xl border border-zinc-200 dark:border-zinc-700 p-1 gap-1 bg-zinc-50 dark:bg-zinc-800">
               {(['select', 'manual'] as const).map(m => (
@@ -243,31 +232,23 @@ function EntryModal({
           )}
 
           {inputMode === 'select' ? (
-            /* book picker */
-            <div>
-              <label className="block text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-2">Pick a book</label>
-              <div className="flex flex-col gap-2 max-h-52 overflow-y-auto pr-1">
-                {activeBooks.map(book => (
-                  <button key={book.id} type="button" onClick={() => setSelectedBookId(book.id)}
-                    className={`flex items-center gap-3 p-2.5 rounded-xl border text-left transition-all ${selectedBookId === book.id ? 'border-zinc-900 dark:border-zinc-300 bg-zinc-50 dark:bg-zinc-800' : 'border-zinc-100 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-600'}`}>
-                    {book.image_url ? (
-                      <img src={book.image_url} alt={book.title} className="w-8 shrink-0 rounded-md object-cover" style={{ aspectRatio: '2/3' }} />
-                    ) : (
-                      <div className="w-8 shrink-0 rounded-md bg-zinc-200 dark:bg-zinc-700 flex items-center justify-center" style={{ aspectRatio: '2/3' }}>
-                        <span className="text-[10px]">📖</span>
-                      </div>
-                    )}
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50 truncate">{book.title}</p>
-                      {book.author && <p className="text-xs text-zinc-400 dark:text-zinc-500 truncate">{book.author}</p>}
-                    </div>
-                    {selectedBookId === book.id && <span className="ml-auto text-zinc-900 dark:text-zinc-100 text-sm shrink-0">✓</span>}
-                  </button>
-                ))}
-              </div>
+            <div className="flex flex-col gap-2 max-h-52 overflow-y-auto pr-1">
+              {activeBooks.map(book => (
+                <button key={book.id} type="button" onClick={() => setSelectedBookId(book.id)}
+                  className={`flex items-center gap-3 p-2.5 rounded-xl border text-left transition-all ${selectedBookId === book.id ? 'border-zinc-900 dark:border-zinc-300 bg-zinc-50 dark:bg-zinc-800' : 'border-zinc-100 dark:border-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-600'}`}>
+                  {book.image_url
+                    ? <img src={book.image_url} alt={book.title} className="w-8 shrink-0 rounded-md object-cover" style={{ aspectRatio: '2/3' }} />
+                    : <div className="w-8 shrink-0 rounded-md bg-zinc-100 dark:bg-zinc-700 flex items-center justify-center text-xs" style={{ aspectRatio: '2/3' }}>📖</div>
+                  }
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50 truncate">{book.title}</p>
+                    {book.author && <p className="text-xs text-zinc-400 truncate">{book.author}</p>}
+                  </div>
+                  {selectedBookId === book.id && <span className="ml-auto shrink-0 text-sm">✓</span>}
+                </button>
+              ))}
             </div>
           ) : (
-            /* manual input */
             <>
               <div>
                 <label className="block text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-1.5">Book Title *</label>
@@ -279,22 +260,23 @@ function EntryModal({
                   preview={imagePreview}
                   onFile={(url, file) => { setImagePreview(url); setImageFile(file) }}
                   onUrl={url => { setImagePreview(url); setImageFile(null) }}
-                  onClear={clearImage}
-                  uploadName={date}
+                  onClear={() => { setImageFile(null); setImagePreview('') }}
                 />
               </div>
             </>
           )}
 
-          {/* notes always visible */}
           <div>
             <label className="block text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-1.5">Reading Notes</label>
-            <textarea value={summary} onChange={e => setSummary(e.target.value)} placeholder="What did you read or think about today?" rows={3} className={`${inputCls} resize-none`} />
+            <textarea value={summary} onChange={e => setSummary(e.target.value)}
+              placeholder="What did you read or think about today?" rows={3}
+              className={`${inputCls} resize-none`} />
           </div>
 
           <div className="flex gap-2 pt-1">
             <button type="button" onClick={onClose} className="flex-1 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 text-sm font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors">Cancel</button>
-            <button type="submit" disabled={saving || !canSubmit} className="flex-1 py-2.5 rounded-xl bg-zinc-900 dark:bg-zinc-100 text-sm font-semibold text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors disabled:opacity-40 flex items-center justify-center gap-2">
+            <button type="submit" disabled={saving || !canSubmit}
+              className="flex-1 py-2.5 rounded-xl bg-zinc-900 dark:bg-zinc-100 text-sm font-semibold text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors disabled:opacity-40 flex items-center justify-center gap-2">
               {saving ? <><span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />Saving…</> : 'Save'}
             </button>
           </div>
@@ -304,26 +286,93 @@ function EntryModal({
   )
 }
 
-// ─── ViewModal ────────────────────────────────────────────────────────────────
+// ─── ViewDayModal ─────────────────────────────────────────────────────────────
 
-function ViewModal({ entry, onClose, onDelete }: { entry: BookEntry; onClose: () => void; onDelete: (date: string) => Promise<void> }) {
+function ViewDayModal({ date, entries, initialIndex, onClose, onDelete, onAddAnother }: {
+  date: string
+  entries: BookEntry[]
+  initialIndex: number
+  onClose: () => void
+  onDelete: (id: string) => Promise<void>
+  onAddAnother: () => void
+}) {
+  const [index, setIndex] = useState(initialIndex)
   const [deleting, setDeleting] = useState(false)
+  const entry = entries[index]
+  const total = entries.length
+
+  // keep index in bounds if entries shrink
+  useEffect(() => {
+    if (index >= entries.length && entries.length > 0) setIndex(entries.length - 1)
+  }, [entries.length, index])
+
+  if (!entry) return null
+
+  const handleDelete = async () => {
+    setDeleting(true)
+    await onDelete(entry.id)
+    setDeleting(false)
+    // if deleted the last one, close; otherwise stay on same index (next entry slides in)
+    if (total === 1) onClose()
+  }
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden border border-zinc-100 dark:border-zinc-800">
-        {entry.image_url && (
-          <div className="w-full h-64 bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
-            <img src={entry.image_url} alt={entry.title} className="w-full h-full object-cover" />
+
+        {/* cover */}
+        <div className="relative w-full h-56 bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
+          {entry.image_url
+            ? <img src={entry.image_url} alt={entry.title} className="w-full h-full object-cover" />
+            : <div className="w-full h-full flex items-center justify-center text-5xl">📖</div>
+          }
+
+          {/* top bar */}
+          <div className="absolute inset-x-0 top-0 flex items-center justify-between p-3">
+            {/* dot indicators */}
+            <div className="flex gap-1.5">
+              {entries.map((_, i) => (
+                <button key={i} onClick={() => setIndex(i)}
+                  className={`rounded-full transition-all ${i === index ? 'w-4 h-2 bg-white' : 'w-2 h-2 bg-white/50 hover:bg-white/80'}`} />
+              ))}
+            </div>
+            <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/60 text-white text-lg transition-colors">×</button>
           </div>
-        )}
-        <div className="p-6">
-          <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500 uppercase tracking-widest mb-1">{entry.date}</p>
-          <h2 className="text-xl font-bold text-zinc-900 dark:text-zinc-50 mb-3">{entry.title}</h2>
-          {entry.summary && <p className="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed whitespace-pre-wrap">{entry.summary}</p>}
-          <div className="flex gap-2 mt-6">
-            <button onClick={onClose} className="flex-1 py-2 rounded-xl border border-zinc-200 dark:border-zinc-700 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors">Close</button>
-            <button onClick={async () => { setDeleting(true); await onDelete(entry.date); setDeleting(false); onClose() }} disabled={deleting} className="py-2 px-4 rounded-xl text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-950 transition-colors disabled:opacity-50">
-              {deleting ? 'Removing…' : 'Remove'}
+
+          {/* prev / next arrows on cover */}
+          {total > 1 && (
+            <>
+              <button onClick={() => setIndex(i => Math.max(0, i - 1))} disabled={index === 0}
+                className="absolute left-2 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/60 text-white disabled:opacity-0 transition-all">‹</button>
+              <button onClick={() => setIndex(i => Math.min(total - 1, i + 1))} disabled={index === total - 1}
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/60 text-white disabled:opacity-0 transition-all">›</button>
+            </>
+          )}
+        </div>
+
+        {/* content */}
+        <div className="p-5">
+          <div className="flex items-start justify-between gap-2 mb-1">
+            <div>
+              <p className="text-xs font-medium text-zinc-400 dark:text-zinc-500 uppercase tracking-widest">{date} · Book {index + 1} of {total}</p>
+              <h2 className="text-lg font-bold text-zinc-900 dark:text-zinc-50 mt-0.5 leading-snug">{entry.title}</h2>
+            </div>
+          </div>
+
+          {entry.summary
+            ? <p className="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed whitespace-pre-wrap mt-2 mb-4">{entry.summary}</p>
+            : <p className="text-sm text-zinc-300 dark:text-zinc-600 italic mt-2 mb-4">No notes for this entry.</p>
+          }
+
+          <div className="flex gap-2">
+            <button onClick={onAddAnother}
+              className="flex-1 py-2.5 rounded-xl bg-zinc-900 dark:bg-zinc-100 text-sm font-semibold text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors">
+              + Add another
+            </button>
+            <button onClick={handleDelete} disabled={deleting}
+              className="py-2.5 px-4 rounded-xl text-sm font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-950 transition-colors disabled:opacity-50">
+              {deleting ? '…' : 'Remove'}
             </button>
           </div>
         </div>
@@ -332,7 +381,7 @@ function ViewModal({ entry, onClose, onDelete }: { entry: BookEntry; onClose: ()
   )
 }
 
-// ─── Library tab ──────────────────────────────────────────────────────────────
+// ─── LibraryTab ───────────────────────────────────────────────────────────────
 
 function LibraryTab({ books, onAdd, onToggle, onDelete }: {
   books: Book[]
@@ -369,34 +418,25 @@ function LibraryTab({ books, onAdd, onToggle, onDelete }: {
 
   const BookRow = ({ book }: { book: Book }) => (
     <div className="flex items-center gap-3 p-3 rounded-xl border border-zinc-100 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-zinc-200 dark:hover:border-zinc-700 transition-colors">
-      {book.image_url ? (
-        <img src={book.image_url} alt={book.title} className="w-9 shrink-0 rounded-lg object-cover shadow" style={{ aspectRatio: '2/3' }} />
-      ) : (
-        <div className="w-9 shrink-0 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center" style={{ aspectRatio: '2/3' }}>
-          <span className="text-sm">📖</span>
-        </div>
-      )}
+      {book.image_url
+        ? <img src={book.image_url} alt={book.title} className="w-9 shrink-0 rounded-lg object-cover shadow" style={{ aspectRatio: '2/3' }} />
+        : <div className="w-9 shrink-0 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center text-sm" style={{ aspectRatio: '2/3' }}>📖</div>
+      }
       <div className="flex-1 min-w-0">
         <p className={`text-sm font-semibold truncate ${book.completed ? 'line-through text-zinc-400 dark:text-zinc-600' : 'text-zinc-900 dark:text-zinc-50'}`}>{book.title}</p>
         {book.author && <p className="text-xs text-zinc-400 dark:text-zinc-500 truncate">{book.author}</p>}
       </div>
       <div className="flex items-center gap-1 shrink-0">
-        <button onClick={() => onToggle(book.id, !book.completed)}
-          title={book.completed ? 'Mark as reading' : 'Mark as completed'}
-          className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs transition-colors ${book.completed ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 hover:text-emerald-600'}`}>
-          ✓
-        </button>
+        <button onClick={() => onToggle(book.id, !book.completed)} title={book.completed ? 'Mark as reading' : 'Mark completed'}
+          className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs transition-colors ${book.completed ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 hover:text-emerald-600'}`}>✓</button>
         <button onClick={() => onDelete(book.id)}
-          className="w-7 h-7 rounded-lg flex items-center justify-center text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-400 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-500 transition-colors">
-          ✕
-        </button>
+          className="w-7 h-7 rounded-lg flex items-center justify-center text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-400 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-500 transition-colors">✕</button>
       </div>
     </div>
   )
 
   return (
     <div className="flex flex-col gap-4">
-      {/* add form */}
       {showForm ? (
         <form onSubmit={handleSubmit} className="p-4 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 flex flex-col gap-3">
           <p className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Add a book</p>
@@ -409,7 +449,6 @@ function LibraryTab({ books, onAdd, onToggle, onDelete }: {
               onFile={(url, file) => { setImagePreview(url); setImageFile(file) }}
               onUrl={url => { setImagePreview(url); setImageFile(null) }}
               onClear={() => { setImageFile(null); setImagePreview('') }}
-              uploadName={title}
             />
           </div>
           <div className="flex gap-2">
@@ -426,26 +465,17 @@ function LibraryTab({ books, onAdd, onToggle, onDelete }: {
         </button>
       )}
 
-      {/* active books */}
-      {active.length > 0 ? (
-        <div className="flex flex-col gap-2">
-          {active.map(b => <BookRow key={b.id} book={b} />)}
-        </div>
-      ) : (
-        <p className="text-sm text-zinc-400 dark:text-zinc-600 text-center py-4">No books in library yet.</p>
-      )}
+      {active.length > 0
+        ? <div className="flex flex-col gap-2">{active.map(b => <BookRow key={b.id} book={b} />)}</div>
+        : <p className="text-sm text-zinc-400 dark:text-zinc-600 text-center py-4">No books in library yet.</p>
+      }
 
-      {/* completed */}
       {completed.length > 0 && (
         <div>
           <button onClick={() => setShowCompleted(v => !v)} className="flex items-center gap-2 text-xs font-semibold text-zinc-400 dark:text-zinc-600 uppercase tracking-wide mb-2">
             <span>{showCompleted ? '▾' : '▸'}</span> Completed ({completed.length})
           </button>
-          {showCompleted && (
-            <div className="flex flex-col gap-2">
-              {completed.map(b => <BookRow key={b.id} book={b} />)}
-            </div>
-          )}
+          {showCompleted && <div className="flex flex-col gap-2">{completed.map(b => <BookRow key={b.id} book={b} />)}</div>}
         </div>
       )}
     </div>
@@ -454,28 +484,37 @@ function LibraryTab({ books, onAdd, onToggle, onDelete }: {
 
 // ─── CalendarDay ──────────────────────────────────────────────────────────────
 
-function CalendarDay({ day, entry, isToday, onClick }: {
-  day: number; entry?: BookEntry; isToday: boolean; onClick: () => void
+function CalendarDay({ day, entries, isToday, onClick }: {
+  day: number; entries: BookEntry[]; isToday: boolean; onClick: () => void
 }) {
+  const first = entries[0]
+  const extra = entries.length - 1
+
   return (
     <button onClick={onClick} style={{ aspectRatio: '2/3' }}
       className={`group relative w-full rounded-xl overflow-hidden border transition-all duration-150 ${
-        entry ? 'border-transparent shadow-sm hover:shadow-md hover:scale-[1.03]'
+        first ? 'border-transparent shadow-sm hover:shadow-md hover:scale-[1.03]'
         : isToday ? 'border-zinc-900 dark:border-zinc-300 bg-zinc-50 dark:bg-zinc-800'
         : 'border-zinc-100 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-zinc-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800'
       }`}>
-      {entry?.image_url ? (
+      {first?.image_url ? (
         <>
-          <img src={entry.image_url} alt={entry.title} className="absolute inset-0 w-full h-full object-cover" />
+          <img src={first.image_url} alt={first.title} className="absolute inset-0 w-full h-full object-cover" />
           <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-150 flex items-end p-1.5">
-            <span className="opacity-0 group-hover:opacity-100 transition-opacity text-white text-[9px] font-semibold leading-tight line-clamp-2 text-left drop-shadow">{entry.title}</span>
+            <span className="opacity-0 group-hover:opacity-100 transition-opacity text-white text-[9px] font-semibold leading-tight line-clamp-2 text-left drop-shadow">{first.title}</span>
           </div>
           <span className="absolute top-1 left-1 text-[10px] font-bold text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]">{day}</span>
+          {extra > 0 && (
+            <span className="absolute top-1 right-1 bg-black/60 text-white text-[9px] font-bold px-1 py-0.5 rounded-md">+{extra}</span>
+          )}
         </>
-      ) : entry ? (
+      ) : first ? (
         <div className="absolute inset-0 bg-zinc-800 dark:bg-zinc-700 flex flex-col items-start justify-between p-2">
           <span className="text-[10px] font-bold text-zinc-400">{day}</span>
-          <span className="text-[9px] font-semibold text-white leading-tight line-clamp-3 text-left">{entry.title}</span>
+          <div>
+            <span className="text-[9px] font-semibold text-white leading-tight line-clamp-2 text-left block">{first.title}</span>
+            {extra > 0 && <span className="text-[9px] text-zinc-400 mt-0.5 block">+{extra} more</span>}
+          </div>
         </div>
       ) : (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-0.5">
@@ -494,7 +533,7 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>('calendar')
   const [year, setYear] = useState(today.getFullYear())
   const [month, setMonth] = useState(today.getMonth())
-  const [entries, setEntries] = useState<EntryMap>({})
+  const [entryMap, setEntryMap] = useState<EntryMap>({})
   const [books, setBooks] = useState<Book[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -505,8 +544,11 @@ export default function Home() {
     try {
       const data = await fetchMonthEntries(y, m)
       const map: EntryMap = {}
-      data.forEach(e => { map[e.date] = e })
-      setEntries(map)
+      data.forEach(e => {
+        if (!map[e.date]) map[e.date] = []
+        map[e.date].push(e)
+      })
+      setEntryMap(map)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load')
     } finally {
@@ -524,26 +566,45 @@ export default function Home() {
   const prevMonth = () => { if (month === 0) { setYear(y => y - 1); setMonth(11) } else setMonth(m => m - 1) }
   const nextMonth = () => { if (month === 11) { setYear(y => y + 1); setMonth(0) } else setMonth(m => m + 1) }
 
-  const handleSave = async (data: { date: string; title: string; image_url: string; summary: string }) => {
-    const saved = await saveEntry(data)
-    setEntries(prev => ({ ...prev, [saved.date]: saved }))
+  const handleDayClick = (dateKey: string) => {
+    const dayEntries = entryMap[dateKey]
+    if (!dayEntries || dayEntries.length === 0) {
+      setModal({ mode: 'add', date: dateKey })
+    } else {
+      setModal({ mode: 'view', date: dateKey, index: 0 })
+    }
   }
 
-  const handleDelete = async (date: string) => {
-    await deleteEntry(date)
-    setEntries(prev => { const next = { ...prev }; delete next[date]; return next })
+  const handleEntrySaved = (entry: BookEntry) => {
+    setEntryMap(prev => {
+      const list = [...(prev[entry.date] ?? []), entry]
+      return { ...prev, [entry.date]: list }
+    })
+  }
+
+  const handleEntryDeleted = async (id: string, date: string) => {
+    await deleteEntry(id)
+    setEntryMap(prev => {
+      const list = (prev[date] ?? []).filter(e => e.id !== id)
+      const next = { ...prev }
+      if (list.length === 0) delete next[date]
+      else next[date] = list
+      return next
+    })
   }
 
   const totalDays = daysInMonth(year, month)
   const startDay = firstDayOfMonth(year, month)
   const todayKey = toDateKey(today.getFullYear(), today.getMonth(), today.getDate())
-  const totalRead = Object.keys(entries).length
+  const totalRead = Object.values(entryMap).reduce((sum, arr) => sum + arr.length, 0)
+
+  const viewDate = modal.mode === 'view' ? modal.date : null
+  const viewEntries = viewDate ? (entryMap[viewDate] ?? []) : []
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 transition-colors duration-300">
       <div className="max-w-2xl mx-auto px-4 py-10">
 
-        {/* Header */}
         <div className="flex items-start justify-between mb-6">
           <div>
             <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-50 tracking-tight">Book Calendar</h1>
@@ -552,11 +613,10 @@ export default function Home() {
           <ThemeToggle />
         </div>
 
-        {/* Tabs */}
         <div className="flex rounded-2xl border border-zinc-200 dark:border-zinc-700 p-1 gap-1 bg-zinc-100 dark:bg-zinc-800 mb-6">
           {(['calendar', 'library'] as const).map(t => (
             <button key={t} onClick={() => setTab(t)}
-              className={`flex-1 py-2 rounded-xl text-sm font-semibold transition-colors capitalize ${tab === t ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-50 shadow-sm' : 'text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300'}`}>
+              className={`flex-1 py-2 rounded-xl text-sm font-semibold transition-colors ${tab === t ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-50 shadow-sm' : 'text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300'}`}>
               {t === 'calendar' ? '📅 Calendar' : '📚 Library'}
             </button>
           ))}
@@ -564,7 +624,6 @@ export default function Home() {
 
         {tab === 'calendar' ? (
           <>
-            {/* Month nav */}
             <div className="flex items-center justify-between mb-6">
               <button onClick={prevMonth} className="w-9 h-9 flex items-center justify-center rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 transition-colors">←</button>
               <div className="text-center">
@@ -597,12 +656,10 @@ export default function Home() {
                   const day = i + 1
                   const dateKey = toDateKey(year, month, day)
                   return (
-                    <CalendarDay key={dateKey} day={day} entry={entries[dateKey]} isToday={dateKey === todayKey}
-                      onClick={() => {
-                        const entry = entries[dateKey]
-                        if (entry) setModal({ mode: 'view', entry })
-                        else setModal({ mode: 'form', date: dateKey })
-                      }} />
+                    <CalendarDay key={dateKey} day={day}
+                      entries={entryMap[dateKey] ?? []}
+                      isToday={dateKey === todayKey}
+                      onClick={() => handleDayClick(dateKey)} />
                   )
                 })}
               </div>
@@ -617,26 +674,36 @@ export default function Home() {
         ) : (
           <LibraryTab
             books={books}
-            onAdd={async (b) => { await saveBook(b); await loadBooks() }}
+            onAdd={async b => { await saveBook(b); await loadBooks() }}
             onToggle={async (id, completed) => { await toggleBookCompleted(id, completed); await loadBooks() }}
-            onDelete={async (id) => { await deleteBook(id); await loadBooks() }}
+            onDelete={async id => { await deleteBook(id); await loadBooks() }}
           />
         )}
       </div>
 
-      {modal.mode === 'form' && (
-        <EntryModal
+      {/* Modals */}
+      {modal.mode === 'add' && (
+        <AddEntryModal
           date={modal.date}
           books={books}
+          dayOrder={(entryMap[modal.date]?.length ?? 0) + 1}
           onClose={() => setModal({ mode: 'closed' })}
-          onSave={handleSave}
+          onSave={entry => {
+            handleEntrySaved(entry)
+            // after saving, open view modal on the new entry
+            setModal({ mode: 'view', date: entry.date, index: (entryMap[entry.date]?.length ?? 0) })
+          }}
         />
       )}
-      {modal.mode === 'view' && (
-        <ViewModal
-          entry={modal.entry}
+
+      {modal.mode === 'view' && viewEntries.length > 0 && (
+        <ViewDayModal
+          date={modal.date}
+          entries={viewEntries}
+          initialIndex={modal.index}
           onClose={() => setModal({ mode: 'closed' })}
-          onDelete={handleDelete}
+          onDelete={async id => { await handleEntryDeleted(id, modal.date) }}
+          onAddAnother={() => setModal({ mode: 'add', date: modal.date })}
         />
       )}
     </div>
